@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import argparse
 import torch
 import torch.nn as nn
@@ -10,6 +12,35 @@ import os
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from socket import gethostname
+
+## Required modules for profiling
+from torch._C._profiler import _ExperimentalConfig, _ExtraFields_PyCall
+from torch.autograd.profiler import KinetoStepTracker, profile as _profile
+from torch.autograd.profiler_legacy import profile as _profile_legacy
+from torch.profiler import (
+    _utils,
+    DeviceType,
+    ExecutionTraceObserver,
+    kineto_available,
+    profile,
+    ProfilerAction,
+    ProfilerActivity,
+    record_function,
+    supported_activities,
+)
+from torch.profiler._pattern_matcher import (
+    Conv2dBiasFollowedByBatchNorm2dPattern,
+    ExtraCUDACopyPattern,
+    ForLoopIndexingPattern,
+    FP32MatMulPattern,
+    GradNotSetToNonePattern,
+    MatMulDimInFP16Pattern,
+    NamePattern,
+    OptimizerSingleTensorPattern,
+    Pattern,
+    report_all_anti_patterns,
+    SynchronizedDataLoaderPattern,
+)
 
 class Net(nn.Module):
     def __init__(self):
@@ -36,21 +67,41 @@ class Net(nn.Module):
         output = F.log_softmax(x, dim=1)
         return output
 
-def train(args, model, device, train_loader, optimizer, epoch):
+def train(args, model, rank, device, train_loader, optimizer, epoch):
     model.train()
-    for batch_idx, (data, target) in enumerate(train_loader):
-        data, target = data.to(device), target.to(device)
-        optimizer.zero_grad()
-        output = model(data)
-        loss = F.nll_loss(output, target)
-        loss.backward()
-        optimizer.step()
-        if batch_idx % args.log_interval == 0:
-            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
-                epoch, batch_idx * len(data), len(train_loader.dataset),
-                100. * batch_idx / len(train_loader), loss.item()))
-            if args.dry_run:
-                break
+
+    # Register Execution Trace Observer
+    eg_file = "./result/host_" + str(rank) + ".json"
+    with torch.profiler.profile(
+        activities=supported_activities(),
+        schedule=torch.profiler.schedule(
+            wait=0, warmup=0, active=1, repeat=1
+        ),
+        with_stack=False,
+        execution_trace_observer=(
+            ExecutionTraceObserver().register_callback(eg_file)
+        ),
+        experimental_config=_ExperimentalConfig(enable_cuda_sync_events=True),
+        record_shapes=True
+    ) as p:
+
+        for batch_idx, (data, target) in enumerate(train_loader):
+            data, target = data.to(device), target.to(device)
+            optimizer.zero_grad()
+            output = model(data)
+            loss = F.nll_loss(output, target)
+            loss.backward()
+            optimizer.step()
+            # profiler step
+            p.step()
+            if batch_idx % args.log_interval == 0:
+                print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
+                    epoch, batch_idx * len(data), len(train_loader.dataset),
+                    100. * batch_idx / len(train_loader), loss.item()))
+                if args.dry_run:
+                    break
+        kineto_file = "./result/device_"+str(rank)+".json"
+        p.export_chrome_trace(kineto_file)
 
 def test(model, device, test_loader):
     model.eval()
@@ -155,7 +206,7 @@ def main():
 
     scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
     for epoch in range(1, args.epochs + 1):
-        train(args, ddp_model, local_rank, train_loader, optimizer, epoch)
+        train(args, ddp_model, rank, local_rank, train_loader, optimizer, epoch)
         if rank == 0: test(ddp_model, local_rank, test_loader)
         scheduler.step()
 
